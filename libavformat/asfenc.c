@@ -34,6 +34,7 @@
 #include "mux.h"
 #include "riff.h"
 #include "asf.h"
+#include "version.h"
 
 #define ASF_INDEXED_INTERVAL    10000000
 #define ASF_INDEX_BLOCK         (1<<9)
@@ -757,6 +758,48 @@ static int asf_write_header(AVFormatContext *s)
     if (s->nb_streams > 127) {
         av_log(s, AV_LOG_ERROR, "ASF can only handle 127 streams\n");
         return AVERROR(EINVAL);
+    }
+
+    for (unsigned n = 0; n < s->nb_streams; n++) {
+        AVStream *st = s->streams[n];
+        if (st->codecpar->codec_id == AV_CODEC_ID_WMALOSSLESS) {
+            has_wmalossless = 1;
+            if (st->codecpar->sample_rate > 48000)
+                wmalossless_hi_res = 1;
+            /* Adjust packet size for WMA Lossless frames if using default size.
+             * WMA Lossless typically uses 12288 bytes (48kHz family) or 13375 bytes
+             * (44.1kHz family), which exceed the ASF default of 3200 bytes.
+             * This prevents unnecessary frame splitting across packet boundaries. */
+            if (st->codecpar->block_align > 0 && asf->packet_size == 3200) {
+                int target_size = st->codecpar->block_align + 100;
+                if (target_size > PACKET_SIZE_MAX)
+                    target_size = PACKET_SIZE_MAX;
+                if (target_size < PACKET_SIZE_MIN)
+                    target_size = PACKET_SIZE_MIN;
+                asf->packet_size = target_size;
+                s->packet_size = asf->packet_size;
+            }
+            break;
+        }
+    }
+
+    if (has_wmalossless) {
+        av_dict_set(&s->metadata, "WMFSDKNeeded", "0.0.0.0000", 0);
+        av_dict_set(&s->metadata, "DeviceConformanceTemplate",
+                    wmalossless_hi_res ? "N2" : "N1", 0);
+        av_dict_set(&s->metadata, "WMFSDKVersion", "12.0.18362.778", 0);
+        av_dict_set(&s->metadata, "IsVBR", "1", 0);
+
+        if (!av_dict_get(s->metadata, "WM/ToolName", NULL, 0))
+            av_dict_set(&s->metadata, "WM/ToolName", "FFmpeg", 0);
+        if (!av_dict_get(s->metadata, "WM/ToolVersion", NULL, 0)) {
+            char version[32];
+            snprintf(version, sizeof(version), "v%d.%d.%d",
+                     LIBAVFORMAT_VERSION_MAJOR,
+                     LIBAVFORMAT_VERSION_MINOR,
+                     LIBAVFORMAT_VERSION_MICRO);
+            av_dict_set(&s->metadata, "WM/ToolVersion", version, 0);
+        }
     }
 
     asf->index_ptr             = av_malloc(sizeof(ASFIndex) * ASF_INDEX_BLOCK);

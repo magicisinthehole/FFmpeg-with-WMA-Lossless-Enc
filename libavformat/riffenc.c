@@ -83,6 +83,9 @@ int ff_put_wav_header(AVFormatContext *s, AVIOContext *pb,
                            par->codec_id == AV_CODEC_ID_EAC3 || par->codec_id == AV_CODEC_ID_DFPWM ||
                            (av_get_bits_per_sample(par->codec_id) > 16 && par->codec_tag != 0x0003);
 
+    if (par->codec_id == AV_CODEC_ID_WMALOSSLESS)
+        waveformatextensible = 0;
+
     if (waveformatextensible)
         avio_wl16(pb, 0xfffe);
     else

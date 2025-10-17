@@ -42,6 +42,7 @@ const AVMetadataConv ff_asf_metadata_conv[] = {
     { "WM/TrackNumber",          "track"            },
     { "WM/MediaStationCallSign", "service_provider" },
     { "WM/MediaStationName",     "service_name"     },
+    { "WM/ISRC",                 "isrc"             },
 //  { "Year"               , "date"        }, TODO: conversion year<->date
     { 0 }
 };
