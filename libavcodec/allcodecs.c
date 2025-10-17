@@ -541,6 +541,7 @@ extern const FFCodec ff_wavarc_decoder;
 extern const FFCodec ff_wavpack_encoder;
 extern const FFCodec ff_wavpack_decoder;
 extern const FFCodec ff_wmalossless_decoder;
+extern const FFCodec ff_wmalossless_encoder;
 extern const FFCodec ff_wmapro_decoder;
 extern const FFCodec ff_wmav1_encoder;
 extern const FFCodec ff_wmav1_decoder;
