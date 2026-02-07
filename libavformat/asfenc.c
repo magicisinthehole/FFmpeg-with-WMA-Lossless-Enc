@@ -750,6 +750,8 @@ static int asf_write_header(AVFormatContext *s)
 {
     ASFContext *asf = s->priv_data;
     int ret;
+    int has_wmalossless = 0;
+    int wmalossless_hi_res = 0;
 
     s->packet_size  = asf->packet_size;
     s->max_interleave_delta = 0;
