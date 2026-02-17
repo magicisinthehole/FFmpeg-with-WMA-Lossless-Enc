@@ -21,7 +21,10 @@
 
 #include "config_components.h"
 
+#include <time.h>
+
 #include "libavutil/avassert.h"
+#include "libavutil/avstring.h"
 #include "libavutil/dict.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
@@ -232,6 +235,31 @@ typedef struct ASFContext {
     int      packet_size;
 } ASFContext;
 
+static const ff_asf_guid ff_asf_stream_bitrate_properties = {
+    0xce, 0x75, 0xf8, 0x7b, 0x8d, 0x46, 0xd1, 0x11,
+    0x8d, 0x82, 0x00, 0x60, 0x97, 0xc9, 0xa2, 0xb2
+};
+
+static const struct {
+    const char *key;
+    ASFDataType type;
+} asf_typed_tags[] = {
+    { "IsVBR",                      ASF_BOOL  },
+    { "WM/WMADRCPeakReference",     ASF_DWORD },
+    { "WM/WMADRCPeakTarget",        ASF_DWORD },
+    { "WM/WMADRCAverageReference",  ASF_DWORD },
+    { "WM/WMADRCAverageTarget",     ASF_DWORD },
+    { NULL, 0 }
+};
+
+static ASFDataType asf_get_tag_type(const char *key)
+{
+    for (int i = 0; asf_typed_tags[i].key; i++)
+        if (!av_strcasecmp(asf_typed_tags[i].key, key))
+            return asf_typed_tags[i].type;
+    return ASF_UNICODE;
+}
+
 static const AVCodecTag codec_asf_bmp_tags[] = {
     { AV_CODEC_ID_MPEG4,     MKTAG('M', '4', 'S', '2') },
     { AV_CODEC_ID_MPEG4,     MKTAG('M', 'P', '4', 'S') },
@@ -366,7 +394,8 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
     AVDictionaryEntry *tags[5];
     int header_size, extra_size, extra_size2, wav_extra_size;
     int has_title, has_aspect_ratio = 0;
-    int metadata_count;
+    int metadata_count, has_wmalossless = 0;
+    int wmalossless_bitrate = 0;
     int64_t header_offset, cur_pos, hpos;
     int bit_rate, ret;
     int64_t duration;
@@ -428,13 +457,24 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         }
     }
 
+    /* detect WMA Lossless — gates Stream Bitrate Properties Object,
+     * Extended Stream Properties, and ASFLeakyBucketPairs descriptor */
+    for (unsigned n = 0; n < s->nb_streams; n++) {
+        if (s->streams[n]->codecpar->codec_id == AV_CODEC_ID_WMALOSSLESS) {
+            has_wmalossless = 1;
+            wmalossless_bitrate = s->streams[n]->codecpar->bit_rate;
+            metadata_count++;  /* for ASFLeakyBucketPairs descriptor */
+            break;
+        }
+    }
+
     if (asf->is_streamed) {
         put_chunk(s, 0x4824, 0, 0xc00); /* start of stream (length will be patched later) */
     }
 
     ff_put_guid(pb, &ff_asf_header);
     avio_wl64(pb, -1); /* header length, will be patched after */
-    avio_wl32(pb, 3 + has_title + !!metadata_count + s->nb_streams); /* number of chunks in header */
+    avio_wl32(pb, 3 + has_wmalossless + has_title + !!metadata_count + s->nb_streams); /* number of chunks in header */
     avio_w8(pb, 1); /* ??? */
     avio_w8(pb, 2); /* ??? */
 
@@ -513,6 +553,33 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
             end_header(pb, es_pos);
         }
     }
+    /* write Extended Stream Properties for WMA Lossless streams
+     * not covered by the language-gated block above */
+    for (unsigned n = 0; n < s->nb_streams; n++) {
+        AVCodecParameters *par = s->streams[n]->codecpar;
+        int64_t es_pos;
+        if (par->codec_id != AV_CODEC_ID_WMALOSSLESS)
+            continue;
+        if (asf->nb_languages && asf->streams[n].stream_language_index <= 127)
+            continue;  /* already written in the language block */
+        es_pos = put_header(pb, &ff_asf_extended_stream_properties_object);
+        avio_wl64(pb, 0); /* start time */
+        avio_wl64(pb, 0); /* end time */
+        avio_wl32(pb, par->bit_rate); /* data bitrate bps */
+        avio_wl32(pb, 5000); /* buffer size ms */
+        avio_wl32(pb, 0); /* initial buffer fullness */
+        avio_wl32(pb, par->bit_rate); /* peak data bitrate */
+        avio_wl32(pb, 5000); /* maximum buffer size ms */
+        avio_wl32(pb, 0); /* max initial buffer fullness */
+        avio_wl32(pb, par->block_align); /* max object size */
+        avio_wl32(pb, 0x02); /* flags: seekable */
+        avio_wl16(pb, n + 1); /* stream number */
+        avio_wl16(pb, 0); /* language id index */
+        avio_wl64(pb, 0); /* avg time per frame */
+        avio_wl16(pb, 0); /* stream name count */
+        avio_wl16(pb, 0); /* payload extension system count */
+        end_header(pb, es_pos);
+    }
     if (has_aspect_ratio) {
         int64_t hpos2;
         hpos2 = put_header(pb, &ff_asf_metadata_header);
@@ -576,9 +643,45 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         hpos = put_header(pb, &ff_asf_extended_content_header);
         avio_wl16(pb, metadata_count);
         while ((tag = av_dict_iterate(s->metadata, tag))) {
+            ASFDataType tag_type = asf_get_tag_type(tag->key);
             put_str16(pb, dyn_buf, tag->key);
-            avio_wl16(pb, 0);
-            put_str16(pb, dyn_buf, tag->value);
+            switch (tag_type) {
+            case ASF_BOOL: {
+                int bval = !av_strcasecmp(tag->value, "true") ||
+                           !av_strcasecmp(tag->value, "1");
+                avio_wl16(pb, ASF_BOOL);
+                avio_wl16(pb, 4);
+                avio_wl32(pb, bval);
+                break;
+            }
+            case ASF_DWORD:
+                avio_wl16(pb, ASF_DWORD);
+                avio_wl16(pb, 4);
+                avio_wl32(pb, strtol(tag->value, NULL, 10));
+                break;
+            default:
+                avio_wl16(pb, ASF_UNICODE);
+                put_str16(pb, dyn_buf, tag->value);
+                break;
+            }
+        }
+        /* ASFLeakyBucketPairs binary descriptor for WMA Lossless VBR */
+        if (has_wmalossless && wmalossless_bitrate > 0) {
+            /* generate 14 bucket pairs spanning 50%-150% of average bitrate */
+            int num_pairs = 14;
+            int data_size = 2 + num_pairs * 8;  /* WORD count + N * (DWORD rate + DWORD buffer) */
+
+            put_str16(pb, dyn_buf, "ASFLeakyBucketPairs");
+            avio_wl16(pb, ASF_BYTE_ARRAY);
+            avio_wl16(pb, data_size);
+            avio_wl16(pb, num_pairs);
+            for (int i = 0; i < num_pairs; i++) {
+                int rate = wmalossless_bitrate * (50 + i * 100 / (num_pairs - 1)) / 100;
+                int buffer_ms = rate > 0 ? (int)((int64_t)asf->packet_size * 8 * 1000 / rate) : 5000;
+                if (buffer_ms < 1000) buffer_ms = 1000;
+                avio_wl32(pb, rate);
+                avio_wl32(pb, buffer_ms);
+            }
         }
         end_header(pb, hpos);
     }
@@ -670,6 +773,8 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         AVCodecParameters *const par = s->streams[n]->codecpar;
         const AVCodecDescriptor *const codec_desc = avcodec_descriptor_get(par->codec_id);
         const char *desc;
+        const char *codec_params = NULL;
+        char wma_params[256];
 
         if (par->codec_type == AVMEDIA_TYPE_AUDIO)
             avio_wl16(pb, 2);
@@ -678,10 +783,19 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         else
             avio_wl16(pb, -1);
 
-        if (par->codec_id == AV_CODEC_ID_WMAV2)
+        if (par->codec_id == AV_CODEC_ID_WMAV2) {
             desc = "Windows Media Audio V8";
-        else
+        } else if (par->codec_id == AV_CODEC_ID_WMALOSSLESS) {
+            desc = "Windows Media Audio 9.2 Lossless";
+            snprintf(wma_params, sizeof(wma_params),
+                     "VBR Quality 100, %d kHz, %d channel %d bit 1-pass VBR",
+                     par->sample_rate / 1000,
+                     par->ch_layout.nb_channels,
+                     par->bits_per_coded_sample);
+            codec_params = wma_params;
+        } else {
             desc = codec_desc ? codec_desc->name : NULL;
+        }
 
         if (desc) {
             uint8_t *buf;
@@ -696,7 +810,18 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         } else
             avio_wl16(pb, 0);
 
-        avio_wl16(pb, 0); /* no parameters */
+        if (codec_params) {
+            uint8_t *buf;
+            int len;
+
+            avio_put_str16le(dyn_buf, codec_params);
+            len = avio_get_dyn_buf(dyn_buf, &buf);
+            avio_wl16(pb, len / 2);
+            avio_write(pb, buf, len);
+            ffio_reset_dyn_buf(dyn_buf);
+        } else {
+            avio_wl16(pb, 0); /* no description */
+        }
 
         /* id */
         if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -712,6 +837,18 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         }
     }
     end_header(pb, hpos);
+
+    /* stream bitrate properties object (WMA Lossless only —
+     * standard ASF object listing per-stream average bitrates) */
+    if (has_wmalossless) {
+        hpos = put_header(pb, &ff_asf_stream_bitrate_properties);
+        avio_wl16(pb, s->nb_streams);
+        for (unsigned i = 0; i < s->nb_streams; i++) {
+            avio_wl16(pb, i + 1);
+            avio_wl32(pb, s->streams[i]->codecpar->bit_rate);
+        }
+        end_header(pb, hpos);
+    }
 
     /* patch the header size fields */
 
@@ -786,6 +923,9 @@ static int asf_write_header(AVFormatContext *s)
     }
 
     if (has_wmalossless) {
+        if (!asf->creation_time)
+            asf->creation_time = (int64_t)time(NULL) * 1000000LL;
+
         av_dict_set(&s->metadata, "WMFSDKNeeded", "0.0.0.0000", 0);
         av_dict_set(&s->metadata, "DeviceConformanceTemplate",
                     wmalossless_hi_res ? "N2" : "N1", 0);
@@ -802,6 +942,15 @@ static int asf_write_header(AVFormatContext *s)
                      LIBAVFORMAT_VERSION_MICRO);
             av_dict_set(&s->metadata, "WM/ToolVersion", version, 0);
         }
+
+        /* Pre-populate DRC tags so the header size is identical between the
+         * initial write and the trailer rewrite. The encoder injects real
+         * values via AV_PKT_DATA_STRINGS_METADATA on the last packet, which
+         * overwrites these placeholders in s->metadata before the rewrite. */
+        av_dict_set(&s->metadata, "WM/WMADRCPeakReference", "0", 0);
+        av_dict_set(&s->metadata, "WM/WMADRCPeakTarget", "0", 0);
+        av_dict_set(&s->metadata, "WM/WMADRCAverageReference", "0", 0);
+        av_dict_set(&s->metadata, "WM/WMADRCAverageTarget", "0", 0);
     }
 
     asf->index_ptr             = av_malloc(sizeof(ASFIndex) * ASF_INDEX_BLOCK);
@@ -1072,8 +1221,25 @@ static int asf_write_packet(AVFormatContext *s, AVPacket *pkt)
     par  = s->streams[pkt->stream_index]->codecpar;
     stream = &asf->streams[pkt->stream_index];
 
-    if (par->codec_type == AVMEDIA_TYPE_AUDIO)
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO &&
+        par->codec_id != AV_CODEC_ID_WMALOSSLESS)
         flags &= ~AV_PKT_FLAG_KEY;
+
+    /* extract DRC metadata from encoder side data */
+    {
+        size_t side_size;
+        const uint8_t *side = av_packet_get_side_data(pkt,
+            AV_PKT_DATA_STRINGS_METADATA, &side_size);
+        if (side) {
+            AVDictionary *dict = NULL;
+            if (av_packet_unpack_dictionary(side, side_size, &dict) >= 0) {
+                const AVDictionaryEntry *e = NULL;
+                while ((e = av_dict_iterate(dict, e)))
+                    av_dict_set(&s->metadata, e->key, e->value, 0);
+                av_dict_free(&dict);
+            }
+        }
+    }
 
     pts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
     av_assert0(pts != AV_NOPTS_VALUE);
