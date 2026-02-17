@@ -271,7 +271,7 @@ static const AVCodecTag *const asf_codec_tags[] = {
         codec_asf_bmp_tags, ff_codec_bmp_tags, ff_codec_wav_tags, NULL
 };
 
-#define PREROLL_TIME 3100
+#define PREROLL_TIME 3000
 
 static void put_str16(AVIOContext *s, AVIOContext *dyn_buf, const char *tag)
 {
@@ -786,13 +786,13 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         if (par->codec_id == AV_CODEC_ID_WMAV2) {
             desc = "Windows Media Audio V8";
         } else if (par->codec_id == AV_CODEC_ID_WMALOSSLESS) {
-            desc = "Windows Media Audio 9.2 Lossless";
             snprintf(wma_params, sizeof(wma_params),
+                     "Windows Media Audio 9.2 Lossless - "
                      "VBR Quality 100, %d kHz, %d channel %d bit 1-pass VBR",
                      par->sample_rate / 1000,
                      par->ch_layout.nb_channels,
                      par->bits_per_coded_sample);
-            codec_params = wma_params;
+            desc = wma_params;
         } else {
             desc = codec_desc ? codec_desc->name : NULL;
         }
@@ -906,11 +906,15 @@ static int asf_write_header(AVFormatContext *s)
             if (st->codecpar->sample_rate > 48000)
                 wmalossless_hi_res = 1;
             /* Adjust packet size for WMA Lossless frames if using default size.
-             * WMA Lossless typically uses 12288 bytes (48kHz family) or 13375 bytes
-             * (44.1kHz family), which exceed the ASF default of 3200 bytes.
-             * This prevents unnecessary frame splitting across packet boundaries. */
+             * Each ASF packet carries exactly one WMA Lossless frame (block_align
+             * bytes) plus fixed overhead: SINGLE_PAYLOAD_HEADERS (26 bytes of
+             * EC + PPI + payload header) + 1 byte padding-length field + 4 bytes
+             * of zero padding = 31 bytes total.  This matches the packet layout
+             * produced by reference WMA Lossless encoders (e.g. fre:ac / Windows
+             * Media Encoder) and is required for reliable Zune device playback. */
             if (st->codecpar->block_align > 0 && asf->packet_size == 3200) {
-                int target_size = st->codecpar->block_align + 100;
+                int target_size = st->codecpar->block_align
+                                + SINGLE_PAYLOAD_HEADERS + 5;
                 if (target_size > PACKET_SIZE_MAX)
                     target_size = PACKET_SIZE_MAX;
                 if (target_size < PACKET_SIZE_MIN)
@@ -1096,7 +1100,7 @@ static void put_payload_header(AVFormatContext *s, ASFStream *stream,
 
 static void put_frame(AVFormatContext *s, ASFStream *stream, AVStream *avst,
                       int64_t timestamp, const uint8_t *buf,
-                      int m_obj_size, int flags)
+                      int m_obj_size, int flags, int64_t pkt_duration)
 {
     ASFContext *asf = s->priv_data;
     int m_obj_offset, payload_len, frag_len1;
@@ -1146,7 +1150,7 @@ static void put_frame(AVFormatContext *s, ASFStream *stream, AVStream *avst,
                 asf->packet_size_left -= (payload_len + PAYLOAD_HEADER_SIZE_MULTIPLE_PAYLOADS);
             else
                 asf->packet_size_left -= (payload_len + PAYLOAD_HEADER_SIZE_SINGLE_PAYLOAD);
-            asf->packet_timestamp_end = timestamp;
+            asf->packet_timestamp_end = timestamp + pkt_duration;
 
             asf->packet_nb_payloads++;
         } else {
@@ -1221,8 +1225,7 @@ static int asf_write_packet(AVFormatContext *s, AVPacket *pkt)
     par  = s->streams[pkt->stream_index]->codecpar;
     stream = &asf->streams[pkt->stream_index];
 
-    if (par->codec_type == AVMEDIA_TYPE_AUDIO &&
-        par->codec_id != AV_CODEC_ID_WMALOSSLESS)
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO)
         flags &= ~AV_PKT_FLAG_KEY;
 
     /* extract DRC metadata from encoder side data */
@@ -1253,7 +1256,7 @@ static int asf_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     packet_number = asf->nb_packets;
     put_frame(s, stream, s->streams[pkt->stream_index],
-              pkt->dts, pkt->data, pkt->size, flags);
+              pkt->dts, pkt->data, pkt->size, flags, pkt->duration);
 
     start_sec = (int)((PREROLL_TIME * 10000 + pts + ASF_INDEXED_INTERVAL - 1)
               / ASF_INDEXED_INTERVAL);
