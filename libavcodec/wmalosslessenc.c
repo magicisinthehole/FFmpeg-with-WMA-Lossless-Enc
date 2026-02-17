@@ -21,6 +21,7 @@
 
 #include "config_components.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -32,6 +33,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
+#include "libavutil/dict.h"
 #include "libavutil/error.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
@@ -40,6 +42,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "encode.h"
+#include "packet.h"
 #include "wma_common.h"
 
 #define ENC_MAX_CHANNELS            8
@@ -489,6 +492,7 @@ typedef struct WMALosslessPacket {
     int       size;                                     ///< packet size in bytes
     uint64_t  pts_samples;                              ///< PTS in samples
     int       duration_samples;                         ///< packet duration in samples
+    uint8_t   is_seekable;                              ///< packet contains a seekable frame
 } WMALosslessPacket;
 
 typedef struct WMALosslessEncContext {
@@ -543,6 +547,11 @@ typedef struct WMALosslessEncContext {
     int pending_frame_seekable;                        ///< flag if pending frame is seekable
     uint16_t pending_frame_samples;                    ///< sample count in pending frame
 
+    /* DRC (Dynamic Range Control) tracking */
+    int32_t  drc_peak;                                 ///< peak absolute sample value
+    uint64_t drc_sum_sq;                               ///< running sum of sample² for RMS
+    uint64_t drc_sample_count;                         ///< total samples processed for DRC
+
     /* statistics */
     int stat_frames_in_packet;                         ///< number of frames in current packet
     int stat_packet_bits_used;                         ///< bits used in current packet
@@ -586,7 +595,7 @@ static void wmalossless_clear_packet_queue(WMALosslessEncContext *s)
 
 static int wmalossless_queue_packet(WMALosslessEncContext *s, const uint8_t *data,
                                     int size, uint64_t pts_samples,
-                                    int duration_samples)
+                                    int duration_samples, int is_seekable)
 {
     WMALosslessPacket *tmp, *pkt;
 
@@ -606,6 +615,7 @@ static int wmalossless_queue_packet(WMALosslessEncContext *s, const uint8_t *dat
     pkt->size = size;
     pkt->pts_samples = pts_samples;
     pkt->duration_samples = duration_samples;
+    pkt->is_seekable = is_seekable;
 
     return 0;
 }
@@ -724,6 +734,18 @@ static int wmalossless_encode_fifo(WMALosslessEncContext *s)
             av_free(tmp16);
         }
     }
+
+    /* update DRC peak and sum-of-squares from decoded PCM */
+    for (c = 0; c < channels; c++) {
+        for (i = 0; i < total_samples; i++) {
+            int32_t v = pcm[c][i];
+            int32_t absv = FFABS(v);
+            if (absv > s->drc_peak)
+                s->drc_peak = absv;
+            s->drc_sum_sq += (uint64_t)v * v;
+        }
+    }
+    s->drc_sample_count += (uint64_t)total_samples * channels;
 
     av_audio_fifo_reset(s->fifo);
 
@@ -914,7 +936,8 @@ static int wmalossless_encode_fifo(WMALosslessEncContext *s)
         s->total_samples += packet_eff_samples;
 
         ret = wmalossless_queue_packet(s, s->packet_buf, s->par.packet_size,
-                                        pkt_pts_samples, packet_eff_samples);
+                                        pkt_pts_samples, packet_eff_samples,
+                                        s->current_packet_has_seekable);
         if (ret < 0)
             goto fail;
     }
@@ -1671,7 +1694,9 @@ static av_cold int wmalossless_encode_init(AVCodecContext *avctx)
     s->samples_per_frame = 1 << frame_len_bits;
     s->log2_frame_size   = wmalossless_ilog2u(s->par.packet_size) + 4;
 
-    avctx->frame_size = s->samples_per_frame;
+    /* Do not set avctx->frame_size — this encoder uses VARIABLE_FRAME_SIZE
+     * and an internal FIFO, so the framework sends arbitrary frame sizes.
+     * Setting frame_size causes the ffmpeg scheduler to expect a sync queue. */
 
     s->packet_buf = av_mallocz(s->par.packet_size);
     if (!s->packet_buf)
@@ -1777,8 +1802,39 @@ static int wmalossless_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     avpkt->size = pkt->size;
     avpkt->pts = ff_samples_to_time_base(avctx, pkt->pts_samples);
     avpkt->duration = ff_samples_to_time_base(avctx, pkt->duration_samples);
+    if (pkt->is_seekable)
+        avpkt->flags |= AV_PKT_FLAG_KEY;
 
     av_freep(&pkt->data);
+
+    /* attach DRC metadata as side data on the last packet */
+    if (s->packet_queue_index >= s->packet_queue_count &&
+        av_audio_fifo_size(s->fifo) <= 0 &&
+        s->drc_sample_count > 0) {
+        double rms = sqrt((double)s->drc_sum_sq / s->drc_sample_count);
+        int drc_avg = (int)(rms * sqrt(2.0));
+        int drc_peak = s->drc_peak;
+        AVDictionary *drc_dict = NULL;
+        uint8_t *side_data;
+        size_t side_size;
+        char buf[32];
+
+        snprintf(buf, sizeof(buf), "%d", drc_peak);
+        av_dict_set(&drc_dict, "WM/WMADRCPeakReference", buf, 0);
+        av_dict_set(&drc_dict, "WM/WMADRCPeakTarget", buf, 0);
+        snprintf(buf, sizeof(buf), "%d", drc_avg);
+        av_dict_set(&drc_dict, "WM/WMADRCAverageReference", buf, 0);
+        av_dict_set(&drc_dict, "WM/WMADRCAverageTarget", buf, 0);
+
+        side_data = av_packet_pack_dictionary(drc_dict, &side_size);
+        av_dict_free(&drc_dict);
+        if (side_data) {
+            ret = av_packet_add_side_data(avpkt, AV_PKT_DATA_STRINGS_METADATA,
+                                          side_data, side_size);
+            if (ret < 0)
+                av_free(side_data);
+        }
+    }
 
     *got_packet = 1;
 
