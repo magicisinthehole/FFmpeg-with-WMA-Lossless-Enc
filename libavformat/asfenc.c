@@ -233,6 +233,10 @@ typedef struct ASFContext {
     int      next_start_sec;
     int      end_sec;
     int      packet_size;
+    int      attached_pic_index;       ///< stream index for Metadata Library WM/Picture, or -1
+    int      attached_pic_thumb_index; ///< stream index for ECD thumbnail WM/Picture, or -1
+    int64_t *pkt_send_times;           ///< per-packet send_time (ms) for ESP leaky bucket
+    uint32_t pkt_stats_alloc;          ///< allocated capacity of pkt_send_times
 } ASFContext;
 
 static const ff_asf_guid ff_asf_stream_bitrate_properties = {
@@ -272,6 +276,42 @@ static const AVCodecTag *const asf_codec_tags[] = {
 };
 
 #define PREROLL_TIME 3000
+
+/**
+ * Return the MIME type string for an attached picture codec.
+ */
+static const char *asf_pic_mime_type(enum AVCodecID codec_id)
+{
+    switch (codec_id) {
+    case AV_CODEC_ID_MJPEG: return "image/jpeg";
+    case AV_CODEC_ID_PNG:   return "image/png";
+    case AV_CODEC_ID_BMP:   return "image/bmp";
+    default:                return "image/jpeg";
+    }
+}
+
+/**
+ * Compute the byte size of a WM/Picture attribute value.
+ * Layout: [1B type][4B data_len][MIME UTF-16LE null-term][desc UTF-16LE null-term][data]
+ */
+static int asf_wm_pic_value_size(const AVPacket *pic, const char *mime)
+{
+    int mime_utf16_len = ((int)strlen(mime) + 1) * 2; /* including null */
+    return 1 + 4 + mime_utf16_len + 2 + pic->size;    /* 2 = empty desc null */
+}
+
+/**
+ * Write the WM/Picture binary value (shared between ECD and Metadata Library).
+ */
+static void asf_write_wm_pic_value(AVIOContext *pb, const AVPacket *pic,
+                                   const char *mime)
+{
+    avio_w8(pb, 3);                                  /* picture type: Front Cover */
+    avio_wl32(pb, pic->size);                        /* picture data length */
+    avio_put_str16le(pb, mime);                      /* MIME type, null-terminated UTF-16LE */
+    avio_wl16(pb, 0);                                /* empty description (null terminator) */
+    avio_write(pb, pic->data, pic->size);            /* raw image data */
+}
 
 static void put_str16(AVIOContext *s, AVIOContext *dyn_buf, const char *tag)
 {
@@ -385,6 +425,83 @@ static void asf_write_markers(AVFormatContext *s, AVIOContext *dyn_buf)
     end_header(pb, hpos);
 }
 
+/**
+ * Compute leaky bucket buffer window for ASFLeakyBucketPairs.
+ *
+ * Models a receiver draining at @p drain_bps where packet i requires
+ * i * pkt_size bytes (zero-indexed: the arriving packet itself is not
+ * yet counted as consumed).  The result is clamped to at least one
+ * packet's transmission time so that even at very high drain rates the
+ * buffer can hold one packet.
+ *
+ * Matches the convention observed in files produced by the Windows
+ * Media Format SDK.
+ *
+ * Returns buffer window in milliseconds.
+ */
+static int asf_leaky_bucket_ms(const int64_t *send_times, uint64_t nb_packets,
+                                int pkt_size, int32_t drain_bps)
+{
+    int64_t max_deficit = 0;
+    int pkt_time;
+
+    for (uint64_t i = 0; i < nb_packets; i++) {
+        int64_t consumed = (int64_t)i * pkt_size;
+        int64_t arrived  = (int64_t)drain_bps * send_times[i] / 8000;
+        int64_t deficit  = consumed - arrived;
+        if (deficit > max_deficit)
+            max_deficit = deficit;
+    }
+
+    pkt_time = drain_bps > 0 ? (int)((int64_t)pkt_size * 8000 / drain_bps) : 0;
+
+    if (drain_bps > 0) {
+        int lb = (int)(max_deficit * 8000 / drain_bps);
+        return lb > pkt_time ? lb : pkt_time;
+    }
+    return 5000;
+}
+
+/**
+ * Compute the ESP buffer_size using the overflow (encoder-side) leaky bucket.
+ *
+ * Per the ASF specification, the encoder fills a bucket with payload data
+ * at the times it is produced (presentation_time), and the bucket drains
+ * at the constant data_bitrate.  The buffer_size is the minimum bucket
+ * capacity (in ms) such that the bucket never overflows.
+ *
+ * This uses a running model where the bucket level is clamped to zero
+ * when it would go negative (the bucket cannot drain below empty).
+ * The payload per sample is block_align (the compressed frame size,
+ * "excluding all ASF Data Packet overhead" per the ASF spec).
+ *
+ * Returns buffer window in milliseconds.
+ */
+static int asf_overflow_buffer_ms(const int64_t *send_times, uint64_t nb_packets,
+                                  int payload_size, int32_t drain_bps)
+{
+    int64_t max_level = 0;
+    int64_t level = 0;
+    int64_t prev_time;
+
+    if (nb_packets < 2 || drain_bps <= 0)
+        return 5000;
+
+    prev_time = send_times[0];
+    for (uint64_t i = 0; i < nb_packets; i++) {
+        int64_t drain = (int64_t)drain_bps * (send_times[i] - prev_time) / 8000;
+        level -= drain;
+        if (level < 0)
+            level = 0;
+        level += payload_size;
+        if (level > max_level)
+            max_level = level;
+        prev_time = send_times[i];
+    }
+
+    return (int)(max_level * 8000 / drain_bps) + 1;
+}
+
 /* write the header (used two times if non streamed) */
 static int asf_write_header1(AVFormatContext *s, int64_t file_size,
                              int64_t data_chunk_size)
@@ -400,6 +517,26 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
     int bit_rate, ret;
     int64_t duration;
     int audio_language_counts[128] = { 0 };
+    int nb_real_streams;
+    int32_t wma_avg_bitrate = 0, wma_peak_bitrate = 0;
+    int wma_avg_buffer_ms = 5000, wma_peak_buffer_ms = 5000;
+    int64_t wma_avg_time = 0;
+    int has_pic       = (asf->attached_pic_index >= 0 &&
+                         s->streams[asf->attached_pic_index]->attached_pic.data);
+    int has_pic_thumb  = (asf->attached_pic_thumb_index >= 0 &&
+                          s->streams[asf->attached_pic_thumb_index]->attached_pic.data);
+
+    /* Count non-attached-pic streams and assign sequential stream numbers.
+     * Attached_pic streams are excluded from the ASF output, so real
+     * streams get 1-based numbering that skips any attached_pic gaps. */
+    nb_real_streams = 0;
+    for (unsigned n = 0; n < s->nb_streams; n++) {
+        if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+            asf->streams[n].num = 0;
+            continue;
+        }
+        asf->streams[n].num = ++nb_real_streams;
+    }
 
     ff_metadata_conv(&s->metadata, ff_asf_metadata_conv, NULL);
 
@@ -419,11 +556,30 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
 
     metadata_count = av_dict_count(s->metadata);
 
+    /* Increment metadata_count for WM/Picture in ECD */
+    if (has_pic_thumb)
+        metadata_count++;
+
+    /* DRC metadata is written per-stream in Metadata Object, not in ECD */
+    {
+        static const char *const drc_keys[] = {
+            "WM/WMADRCPeakReference", "WM/WMADRCPeakTarget",
+            "WM/WMADRCAverageReference", "WM/WMADRCAverageTarget",
+        };
+        for (int i = 0; i < FF_ARRAY_ELEMS(drc_keys); i++) {
+            if (av_dict_get(s->metadata, drc_keys[i], NULL, 0))
+                metadata_count--;
+        }
+    }
+
     bit_rate = 0;
     for (unsigned n = 0; n < s->nb_streams; n++) {
         AVStream *const st = s->streams[n];
         AVCodecParameters *const par = st->codecpar;
         AVDictionaryEntry *entry;
+
+        if (st->disposition & AV_DISPOSITION_ATTACHED_PIC)
+            continue;
 
         avpriv_set_pts_info(s->streams[n], 32, 1, 1000); /* 32 bit pts in ms */
 
@@ -468,13 +624,88 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         }
     }
 
+    /* Pre-compute WMA Lossless bitrate and buffer stats for trailer rewrite.
+     * Used in File Properties, ESP, Stream Bitrate Properties,
+     * and ASFLeakyBucketPairs.
+     *
+     * Average bitrate is computed over send_duration only (excludes preroll).
+     * Buffer window uses the encoder-side overflow leaky bucket model: data
+     * enters at production time (block_align per sample), drains at constant
+     * data_bitrate, and the bucket must never overflow.
+     * Alt (peak) buffer window is a fixed 1570 ms; the alt bitrate is the
+     * peak over a 5-second sliding window, rounded down to a 5000 bps
+     * boundary. */
+    if (file_size && has_wmalossless && asf->pkt_send_times
+        && asf->nb_packets > 1 && asf->duration > 0) {
+        int64_t data_bytes = data_chunk_size - DATA_HEADER_SIZE;
+        int pkt_size = s->packet_size;
+        int block_align = 0;
+
+        /* Find block_align from the WMA Lossless stream */
+        for (unsigned n = 0; n < s->nb_streams; n++) {
+            if (s->streams[n]->codecpar->codec_id == AV_CODEC_ID_WMALOSSLESS) {
+                block_align = s->streams[n]->codecpar->block_align;
+                break;
+            }
+        }
+
+        /* avg bitrate over send_duration */
+        wma_avg_bitrate = (int32_t)(data_bytes * 8 * 10000000LL /
+                                    asf->duration);
+        wma_avg_time = duration / asf->nb_packets;
+
+        /* Buffer window: overflow leaky bucket at data_bitrate.
+         * Uses block_align as the payload per sample (compressed frame size,
+         * excluding ASF data packet overhead). */
+        if (block_align > 0)
+            wma_avg_buffer_ms = asf_overflow_buffer_ms(asf->pkt_send_times,
+                                                       asf->nb_packets,
+                                                       block_align,
+                                                       wma_avg_bitrate);
+        else
+            wma_avg_buffer_ms = wma_avg_bitrate / 60;
+        if (wma_avg_buffer_ms < 1000)
+            wma_avg_buffer_ms = 1000;
+
+        /* Peak bitrate: max rate over 5-second sliding windows.
+         * A 5-second window captures sustained bursts while filtering
+         * single-packet timing jitter. */
+        {
+            int64_t max_rate = 0;
+            uint64_t j = 0;
+            for (uint64_t i = 1; i < asf->nb_packets; i++) {
+                int64_t dt, n_pkts, rate;
+                while (j < i - 1 &&
+                       asf->pkt_send_times[i] -
+                       asf->pkt_send_times[j + 1] >= 5000)
+                    j++;
+                dt = asf->pkt_send_times[i] - asf->pkt_send_times[j];
+                if (dt > 0) {
+                    n_pkts = i - j;
+                    rate = n_pkts * (int64_t)pkt_size * 8000 / dt;
+                    if (rate > max_rate)
+                        max_rate = rate;
+                }
+            }
+            if (max_rate > INT32_MAX)
+                max_rate = INT32_MAX;
+            wma_peak_bitrate = max_rate > wma_avg_bitrate
+                             ? (int32_t)max_rate : wma_avg_bitrate;
+        }
+
+        /* Alt buffer: fixed 1570 ms */
+        wma_peak_buffer_ms = 1570;
+
+        wmalossless_bitrate = wma_avg_bitrate;
+    }
+
     if (asf->is_streamed) {
         put_chunk(s, 0x4824, 0, 0xc00); /* start of stream (length will be patched later) */
     }
 
     ff_put_guid(pb, &ff_asf_header);
     avio_wl64(pb, -1); /* header length, will be patched after */
-    avio_wl32(pb, 3 + has_wmalossless + has_title + !!metadata_count + s->nb_streams); /* number of chunks in header */
+    avio_wl32(pb, 3 + has_wmalossless + has_title + !!metadata_count + nb_real_streams); /* number of chunks in header */
     avio_w8(pb, 1); /* ??? */
     avio_w8(pb, 2); /* ??? */
 
@@ -491,7 +722,14 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
     avio_wl32(pb, (asf->is_streamed || !(pb->seekable & AVIO_SEEKABLE_NORMAL)) ? 3 : 2);  /* ??? */
     avio_wl32(pb, s->packet_size); /* packet size */
     avio_wl32(pb, s->packet_size); /* packet size */
-    avio_wl32(pb, bit_rate ? bit_rate : -1); /* Maximum data rate in bps */
+    {
+        int max_bitrate = bit_rate ? bit_rate : -1;
+        if (has_wmalossless && wma_peak_bitrate > 0)
+            max_bitrate = wma_peak_bitrate;
+        else if (has_wmalossless && wma_avg_bitrate > 0)
+            max_bitrate = wma_avg_bitrate;
+        avio_wl32(pb, max_bitrate); /* Maximum data rate in bps */
+    }
     end_header(pb, hpos);
 
     /* header_extension */
@@ -524,7 +762,7 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
                     avio_wl16(pb, audio_language_counts[i]);
                     for (unsigned n = 0; n < s->nb_streams; n++)
                         if (asf->streams[n].stream_language_index == i && s->streams[n]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-                            avio_wl16(pb, n + 1);
+                            avio_wl16(pb, asf->streams[n].num);
                 }
             }
             end_header(pb, hpos2);
@@ -532,6 +770,8 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
 
         for (unsigned n = 0; n < s->nb_streams; n++) {
             int64_t es_pos;
+            if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+                continue;
             if (asf->streams[n].stream_language_index > 127)
                 continue;
             es_pos = put_header(pb, &ff_asf_extended_stream_properties_object);
@@ -545,7 +785,7 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
             avio_wl32(pb, 0); /* max initial buffer fullness */
             avio_wl32(pb, 0); /* max object size */
             avio_wl32(pb, (!asf->is_streamed && (pb->seekable & AVIO_SEEKABLE_NORMAL)) << 1); /* flags - seekable */
-            avio_wl16(pb, n + 1); /* stream number */
+            avio_wl16(pb, asf->streams[n].num); /* stream number */
             avio_wl16(pb, asf->streams[n].stream_language_index); /* language id index */
             avio_wl64(pb, 0); /* avg time per frame */
             avio_wl16(pb, 0); /* stream name count */
@@ -558,57 +798,188 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
     for (unsigned n = 0; n < s->nb_streams; n++) {
         AVCodecParameters *par = s->streams[n]->codecpar;
         int64_t es_pos;
+        int32_t esp_bitrate, esp_peak_bitrate;
+        int esp_buffer_ms, esp_peak_buffer_ms;
+        int64_t avg_time;
+        if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+            continue;
         if (par->codec_id != AV_CODEC_ID_WMALOSSLESS)
             continue;
         if (asf->nb_languages && asf->streams[n].stream_language_index <= 127)
             continue;  /* already written in the language block */
+
+        /* Use pre-computed stats during trailer rewrite, defaults otherwise */
+        if (wma_avg_bitrate > 0) {
+            esp_bitrate      = wma_avg_bitrate;
+            esp_peak_bitrate = (wma_peak_bitrate / 5000) * 5000;
+            esp_buffer_ms      = wma_avg_buffer_ms;
+            esp_peak_buffer_ms = wma_peak_buffer_ms;
+            avg_time = wma_avg_time;
+        } else {
+            esp_bitrate      = par->bit_rate;
+            esp_peak_bitrate = par->bit_rate;
+            esp_buffer_ms      = 5000;
+            esp_peak_buffer_ms = 5000;
+            avg_time = 0;
+        }
+
         es_pos = put_header(pb, &ff_asf_extended_stream_properties_object);
-        avio_wl64(pb, 0); /* start time */
-        avio_wl64(pb, 0); /* end time */
-        avio_wl32(pb, par->bit_rate); /* data bitrate bps */
-        avio_wl32(pb, 5000); /* buffer size ms */
-        avio_wl32(pb, 0); /* initial buffer fullness */
-        avio_wl32(pb, par->bit_rate); /* peak data bitrate */
-        avio_wl32(pb, 5000); /* maximum buffer size ms */
-        avio_wl32(pb, 0); /* max initial buffer fullness */
-        avio_wl32(pb, par->block_align); /* max object size */
-        avio_wl32(pb, 0x02); /* flags: seekable */
-        avio_wl16(pb, n + 1); /* stream number */
-        avio_wl16(pb, 0); /* language id index */
-        avio_wl64(pb, 0); /* avg time per frame */
-        avio_wl16(pb, 0); /* stream name count */
-        avio_wl16(pb, 0); /* payload extension system count */
+        avio_wl64(pb, 0);                  /* start time */
+        avio_wl64(pb, 0);                  /* end time */
+        avio_wl32(pb, esp_bitrate);        /* data bitrate bps */
+        avio_wl32(pb, esp_buffer_ms);      /* buffer size ms */
+        avio_wl32(pb, 0);                  /* initial buffer fullness */
+        avio_wl32(pb, esp_peak_bitrate);   /* peak data bitrate */
+        avio_wl32(pb, esp_peak_buffer_ms); /* max buffer size ms */
+        avio_wl32(pb, 0);                  /* max initial buffer fullness */
+        avio_wl32(pb, par->block_align);   /* max object size */
+        avio_wl32(pb, 0x02);               /* flags: seekable */
+        avio_wl16(pb, asf->streams[n].num); /* stream number */
+        avio_wl16(pb, 0);                  /* language id index */
+        avio_wl64(pb, avg_time);           /* avg time per frame (100ns units) */
+        avio_wl16(pb, 0);                  /* stream name count */
+        avio_wl16(pb, 0);                  /* payload extension system count */
         end_header(pb, es_pos);
     }
-    if (has_aspect_ratio) {
-        int64_t hpos2;
-        hpos2 = put_header(pb, &ff_asf_metadata_header);
-        avio_wl16(pb, 2 * has_aspect_ratio);
-        for (unsigned n = 0; n < s->nb_streams; n++) {
-            AVCodecParameters *const par = s->streams[n]->codecpar;
-            if (   par->codec_type == AVMEDIA_TYPE_VIDEO
-                && par->sample_aspect_ratio.num > 0
-                && par->sample_aspect_ratio.den > 0) {
-                AVRational sar = par->sample_aspect_ratio;
-                avio_wl16(pb, 0);
-                // the stream number is set like this below
-                avio_wl16(pb, n + 1);
-                avio_wl16(pb, 26); // name_len
-                avio_wl16(pb,  3); // value_type
-                avio_wl32(pb,  4); // value_len
-                avio_put_str16le(pb, "AspectRatioX");
-                avio_wl32(pb, sar.num);
-                avio_wl16(pb, 0);
-                // the stream number is set like this below
-                avio_wl16(pb, n + 1);
-                avio_wl16(pb, 26); // name_len
-                avio_wl16(pb,  3); // value_type
-                avio_wl32(pb,  4); // value_len
-                avio_put_str16le(pb, "AspectRatioY");
-                avio_wl32(pb, sar.den);
+    {
+        int metadata_obj_count = 2 * has_aspect_ratio;
+        int wmalossless_stream_num = 0;
+
+        if (has_wmalossless) {
+            metadata_obj_count += 6; /* IsVBR, DeviceConformanceTemplate, 4x DRC */
+            for (unsigned n = 0; n < s->nb_streams; n++) {
+                if (s->streams[n]->codecpar->codec_id == AV_CODEC_ID_WMALOSSLESS) {
+                    wmalossless_stream_num = asf->streams[n].num;
+                    break;
+                }
             }
         }
-        end_header(pb, hpos2);
+
+        if (metadata_obj_count) {
+            int64_t hpos2;
+            const AVDictionaryEntry *e;
+            int drc_peak = 0, drc_avg = 0;
+
+            hpos2 = put_header(pb, &ff_asf_metadata_header);
+            avio_wl16(pb, metadata_obj_count);
+
+            /* Aspect ratio records (skip attached_pic video streams) */
+            for (unsigned n = 0; n < s->nb_streams; n++) {
+                AVCodecParameters *const par = s->streams[n]->codecpar;
+                if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+                    continue;
+                if (   par->codec_type == AVMEDIA_TYPE_VIDEO
+                    && par->sample_aspect_ratio.num > 0
+                    && par->sample_aspect_ratio.den > 0) {
+                    AVRational sar = par->sample_aspect_ratio;
+                    avio_wl16(pb, 0);
+                    avio_wl16(pb, asf->streams[n].num);
+                    avio_wl16(pb, 26);  /* name_len */
+                    avio_wl16(pb,  3);  /* value_type */
+                    avio_wl32(pb,  4);  /* value_len */
+                    avio_put_str16le(pb, "AspectRatioX");
+                    avio_wl32(pb, sar.num);
+                    avio_wl16(pb, 0);
+                    avio_wl16(pb, asf->streams[n].num);
+                    avio_wl16(pb, 26);  /* name_len */
+                    avio_wl16(pb,  3);  /* value_type */
+                    avio_wl32(pb,  4);  /* value_len */
+                    avio_put_str16le(pb, "AspectRatioY");
+                    avio_wl32(pb, sar.den);
+                }
+            }
+
+            /* WMA Lossless per-stream attributes */
+            if (has_wmalossless) {
+                e = av_dict_get(s->metadata, "WM/WMADRCPeakReference", NULL, 0);
+                if (e) drc_peak = strtol(e->value, NULL, 10);
+                e = av_dict_get(s->metadata, "WM/WMADRCAverageReference", NULL, 0);
+                if (e) drc_avg = strtol(e->value, NULL, 10);
+
+                /* IsVBR (BOOL, WORD-sized) */
+                avio_wl16(pb, 0);                              /* lang */
+                avio_wl16(pb, wmalossless_stream_num);         /* stream */
+                avio_wl16(pb, sizeof("IsVBR") * 2);            /* name_len */
+                avio_wl16(pb, 2);                              /* type: BOOL */
+                avio_wl32(pb, 2);                              /* val_len */
+                avio_put_str16le(pb, "IsVBR");
+                avio_wl16(pb, 1);
+
+                /* DeviceConformanceTemplate (Unicode) */
+                e = av_dict_get(s->metadata,
+                                "DeviceConformanceTemplate",
+                                NULL, 0);
+                {
+                    const char *dct = e ? e->value : "N1";
+                    avio_wl16(pb, 0);
+                    avio_wl16(pb, wmalossless_stream_num);
+                    avio_wl16(pb, sizeof("DeviceConformanceTemplate") * 2);
+                    avio_wl16(pb, 0);                          /* type: Unicode */
+                    avio_wl32(pb, (strlen(dct) + 1) * 2);
+                    avio_put_str16le(pb, "DeviceConformanceTemplate");
+                    avio_put_str16le(pb, dct);
+                }
+
+                /* WM/WMADRCPeakReference (DWORD) */
+                avio_wl16(pb, 0);
+                avio_wl16(pb, wmalossless_stream_num);
+                avio_wl16(pb, sizeof("WM/WMADRCPeakReference") * 2);
+                avio_wl16(pb, 3);                              /* type: DWORD */
+                avio_wl32(pb, 4);
+                avio_put_str16le(pb, "WM/WMADRCPeakReference");
+                avio_wl32(pb, drc_peak);
+
+                /* WM/WMADRCPeakTarget (DWORD) */
+                avio_wl16(pb, 0);
+                avio_wl16(pb, wmalossless_stream_num);
+                avio_wl16(pb, sizeof("WM/WMADRCPeakTarget") * 2);
+                avio_wl16(pb, 3);
+                avio_wl32(pb, 4);
+                avio_put_str16le(pb, "WM/WMADRCPeakTarget");
+                avio_wl32(pb, drc_peak);
+
+                /* WM/WMADRCAverageReference (DWORD) */
+                avio_wl16(pb, 0);
+                avio_wl16(pb, wmalossless_stream_num);
+                avio_wl16(pb, sizeof("WM/WMADRCAverageReference") * 2);
+                avio_wl16(pb, 3);
+                avio_wl32(pb, 4);
+                avio_put_str16le(pb, "WM/WMADRCAverageReference");
+                avio_wl32(pb, drc_avg);
+
+                /* WM/WMADRCAverageTarget (DWORD) */
+                avio_wl16(pb, 0);
+                avio_wl16(pb, wmalossless_stream_num);
+                avio_wl16(pb, sizeof("WM/WMADRCAverageTarget") * 2);
+                avio_wl16(pb, 3);
+                avio_wl32(pb, 4);
+                avio_put_str16le(pb, "WM/WMADRCAverageTarget");
+                avio_wl32(pb, drc_avg);
+            }
+
+            end_header(pb, hpos2);
+        }
+    }
+    /* Write Metadata Library Object for full-size WM/Picture inside Header Extension */
+    if (has_pic) {
+        int64_t ml_pos;
+        AVStream *pic_st  = s->streams[asf->attached_pic_index];
+        AVPacket *pic_pkt = &pic_st->attached_pic;
+        const char *mime  = asf_pic_mime_type(pic_st->codecpar->codec_id);
+        int name_utf16_len = ((int)strlen("WM/Picture") + 1) * 2; /* 22 bytes */
+        int val_size       = asf_wm_pic_value_size(pic_pkt, mime);
+
+        ml_pos = put_header(pb, &ff_asf_metadata_library_header);
+        avio_wl16(pb, 1);                    /* records count */
+        /* record fields */
+        avio_wl16(pb, 0);                    /* lang_list_index */
+        avio_wl16(pb, 0);                    /* stream_number */
+        avio_wl16(pb, name_utf16_len);       /* name_len (bytes) */
+        avio_wl16(pb, ASF_BYTE_ARRAY);       /* value_type */
+        avio_wl32(pb, val_size);             /* value_len (DWORD) */
+        avio_put_str16le(pb, "WM/Picture");  /* name */
+        asf_write_wm_pic_value(pb, pic_pkt, mime);
+        end_header(pb, ml_pos);
     }
     {
         int64_t pos1;
@@ -643,7 +1014,16 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         hpos = put_header(pb, &ff_asf_extended_content_header);
         avio_wl16(pb, metadata_count);
         while ((tag = av_dict_iterate(s->metadata, tag))) {
-            ASFDataType tag_type = asf_get_tag_type(tag->key);
+            ASFDataType tag_type;
+            /* DRC metadata belongs in the per-stream Metadata Object.
+             * av_dict_get (used for counting) is case-insensitive,
+             * so match the same way here. */
+            if (!av_strcasecmp(tag->key, "WM/WMADRCPeakReference") ||
+                !av_strcasecmp(tag->key, "WM/WMADRCPeakTarget") ||
+                !av_strcasecmp(tag->key, "WM/WMADRCAverageReference") ||
+                !av_strcasecmp(tag->key, "WM/WMADRCAverageTarget"))
+                continue;
+            tag_type = asf_get_tag_type(tag->key);
             put_str16(pb, dyn_buf, tag->key);
             switch (tag_type) {
             case ASF_BOOL: {
@@ -665,23 +1045,44 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
                 break;
             }
         }
-        /* ASFLeakyBucketPairs binary descriptor for WMA Lossless VBR */
+        /* ASFLeakyBucketPairs: 14 fixed rates matching the WMF SDK schedule.
+         * Format: [WORD reserved=0] [DWORD rate, DWORD buffer_ms] * 14 */
         if (has_wmalossless && wmalossless_bitrate > 0) {
-            /* generate 14 bucket pairs spanning 50%-150% of average bitrate */
-            int num_pairs = 14;
-            int data_size = 2 + num_pairs * 8;  /* WORD count + N * (DWORD rate + DWORD buffer) */
+            static const int32_t bucket_rates[] = {
+                24000, 30000, 45000, 58000, 115200, 240000, 350000,
+                500000, 730000, 1000000, 1400000, 2100000, 5000000, 10000000
+            };
+            int num_pairs = FF_ARRAY_ELEMS(bucket_rates);
+            int data_size = 2 + num_pairs * 8;  /* WORD reserved + N * (DWORD rate + DWORD buffer) */
 
             put_str16(pb, dyn_buf, "ASFLeakyBucketPairs");
             avio_wl16(pb, ASF_BYTE_ARRAY);
             avio_wl16(pb, data_size);
-            avio_wl16(pb, num_pairs);
+            avio_wl16(pb, 0);  /* reserved */
             for (int i = 0; i < num_pairs; i++) {
-                int rate = wmalossless_bitrate * (50 + i * 100 / (num_pairs - 1)) / 100;
-                int buffer_ms = rate > 0 ? (int)((int64_t)asf->packet_size * 8 * 1000 / rate) : 5000;
-                if (buffer_ms < 1000) buffer_ms = 1000;
+                int32_t rate = bucket_rates[i];
+                int buffer_ms;
+                if (asf->pkt_send_times && asf->nb_packets > 1)
+                    buffer_ms = asf_leaky_bucket_ms(asf->pkt_send_times,
+                                                     asf->nb_packets,
+                                                     s->packet_size, rate);
+                else
+                    buffer_ms = rate > 0 ? (int)((int64_t)s->packet_size * 8000 / rate) : 5000;
                 avio_wl32(pb, rate);
                 avio_wl32(pb, buffer_ms);
             }
+        }
+        /* WM/Picture thumbnail in Extended Content Description */
+        if (has_pic_thumb) {
+            AVStream *thumb_st  = s->streams[asf->attached_pic_thumb_index];
+            AVPacket *thumb_pkt = &thumb_st->attached_pic;
+            const char *mime    = asf_pic_mime_type(thumb_st->codecpar->codec_id);
+            int val_size        = asf_wm_pic_value_size(thumb_pkt, mime);
+
+            put_str16(pb, dyn_buf, "WM/Picture");
+            avio_wl16(pb, ASF_BYTE_ARRAY);
+            avio_wl16(pb, val_size);
+            asf_write_wm_pic_value(pb, thumb_pkt, mime);
         }
         end_header(pb, hpos);
     }
@@ -693,9 +1094,10 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
     for (unsigned n = 0; n < s->nb_streams; n++) {
         AVCodecParameters *const par = s->streams[n]->codecpar;
         int64_t es_pos;
-        //        ASFStream *stream = &asf->streams[n];
 
-        asf->streams[n].num = n + 1;
+        if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+            continue;
+
         asf->streams[n].seq = 1;
 
         switch (par->codec_type) {
@@ -724,7 +1126,7 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         es_pos = avio_tell(pb);
         avio_wl32(pb, extra_size); /* wav header len */
         avio_wl32(pb, extra_size2); /* additional data len */
-        avio_wl16(pb, n + 1); /* stream number */
+        avio_wl16(pb, asf->streams[n].num); /* stream number */
         avio_wl32(pb, 0); /* ??? */
 
         if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -768,13 +1170,16 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
 
     hpos = put_header(pb, &ff_asf_codec_comment_header);
     ff_put_guid(pb, &ff_asf_codec_comment1_header);
-    avio_wl32(pb, s->nb_streams);
+    avio_wl32(pb, nb_real_streams);
     for (unsigned n = 0; n < s->nb_streams; n++) {
         AVCodecParameters *const par = s->streams[n]->codecpar;
         const AVCodecDescriptor *const codec_desc = avcodec_descriptor_get(par->codec_id);
         const char *desc;
         const char *codec_params = NULL;
         char wma_params[256];
+
+        if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+            continue;
 
         if (par->codec_type == AVMEDIA_TYPE_AUDIO)
             avio_wl16(pb, 2);
@@ -786,13 +1191,13 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
         if (par->codec_id == AV_CODEC_ID_WMAV2) {
             desc = "Windows Media Audio V8";
         } else if (par->codec_id == AV_CODEC_ID_WMALOSSLESS) {
+            desc = "Windows Media Audio 9.2 Lossless";
             snprintf(wma_params, sizeof(wma_params),
-                     "Windows Media Audio 9.2 Lossless - "
                      "VBR Quality 100, %d kHz, %d channel %d bit 1-pass VBR",
                      par->sample_rate / 1000,
                      par->ch_layout.nb_channels,
                      par->bits_per_coded_sample);
-            desc = wma_params;
+            codec_params = wma_params;
         } else {
             desc = codec_desc ? codec_desc->name : NULL;
         }
@@ -839,13 +1244,20 @@ static int asf_write_header1(AVFormatContext *s, int64_t file_size,
     end_header(pb, hpos);
 
     /* stream bitrate properties object (WMA Lossless only —
-     * standard ASF object listing per-stream average bitrates) */
+     * per-stream bitrate; reference encoders use peak bitrate here) */
     if (has_wmalossless) {
         hpos = put_header(pb, &ff_asf_stream_bitrate_properties);
-        avio_wl16(pb, s->nb_streams);
+        avio_wl16(pb, nb_real_streams);
         for (unsigned i = 0; i < s->nb_streams; i++) {
-            avio_wl16(pb, i + 1);
-            avio_wl32(pb, s->streams[i]->codecpar->bit_rate);
+            int32_t stream_bitrate;
+            if (s->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+                continue;
+            if (wma_peak_bitrate > 0)
+                stream_bitrate = wma_peak_bitrate;
+            else
+                stream_bitrate = s->streams[i]->codecpar->bit_rate;
+            avio_wl16(pb, asf->streams[i].num);
+            avio_wl32(pb, stream_bitrate);
         }
         end_header(pb, hpos);
     }
@@ -897,6 +1309,42 @@ static int asf_write_header(AVFormatContext *s)
     if (s->nb_streams > 127) {
         av_log(s, AV_LOG_ERROR, "ASF can only handle 127 streams\n");
         return AVERROR(EINVAL);
+    }
+
+    /* Classify attached_pic streams for WM/Picture embedding.
+     * Two streams: smaller → ECD thumbnail, larger → Metadata Library.
+     * One stream:  Metadata Library always; also ECD if value fits in WORD. */
+    asf->attached_pic_index       = -1;
+    asf->attached_pic_thumb_index = -1;
+    {
+        int pic_indices[2] = { -1, -1 };
+        int pic_count = 0;
+        for (unsigned n = 0; n < s->nb_streams; n++) {
+            if (s->streams[n]->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+                if (pic_count < 2)
+                    pic_indices[pic_count] = n;
+                pic_count++;
+            }
+        }
+        if (pic_count == 2) {
+            int a = pic_indices[0], b = pic_indices[1];
+            int size_a = s->streams[a]->attached_pic.size;
+            int size_b = s->streams[b]->attached_pic.size;
+            if (size_a <= size_b) {
+                asf->attached_pic_thumb_index = a;
+                asf->attached_pic_index       = b;
+            } else {
+                asf->attached_pic_thumb_index = b;
+                asf->attached_pic_index       = a;
+            }
+        } else if (pic_count == 1) {
+            int idx = pic_indices[0];
+            const char *mime = asf_pic_mime_type(s->streams[idx]->codecpar->codec_id);
+            int val_size = asf_wm_pic_value_size(&s->streams[idx]->attached_pic, mime);
+            asf->attached_pic_index = idx;
+            if (val_size <= 0xFFFF)
+                asf->attached_pic_thumb_index = idx;
+        }
     }
 
     for (unsigned n = 0; n < s->nb_streams; n++) {
@@ -1061,6 +1509,28 @@ static void flush_packet(AVFormatContext *s)
     avio_write_marker(s->pb, AV_NOPTS_VALUE, AVIO_DATA_MARKER_FLUSH_POINT);
 
     asf->nb_packets++;
+
+    /* Track packet timestamps for ESP leaky bucket computation.
+     * On allocation failure the array is not grown; ESP computation
+     * will fall back to defaults during the trailer rewrite. */
+    if (asf->nb_packets > asf->pkt_stats_alloc) {
+        uint32_t new_alloc = asf->pkt_stats_alloc <= UINT32_MAX / 2
+                           ? FFMAX(asf->pkt_stats_alloc * 2, 1024)
+                           : UINT32_MAX;
+        int64_t *new_times = av_realloc_array(asf->pkt_send_times, new_alloc,
+                                               sizeof(*new_times));
+        if (new_times) {
+            asf->pkt_send_times  = new_times;
+            asf->pkt_stats_alloc = new_alloc;
+        } else {
+            av_log(s, AV_LOG_WARNING,
+                   "Failed to grow packet timestamp array; "
+                   "ESP values will use defaults\n");
+        }
+    }
+    if (asf->pkt_send_times && asf->nb_packets <= asf->pkt_stats_alloc)
+        asf->pkt_send_times[asf->nb_packets - 1] = asf->packet_timestamp_start;
+
     asf->packet_nb_payloads     = 0;
     asf->packet_timestamp_start = -1;
     asf->packet_timestamp_end   = -1;
@@ -1222,6 +1692,11 @@ static int asf_write_packet(AVFormatContext *s, AVPacket *pkt)
     int ret;
     uint64_t offset = avio_tell(pb);
 
+    /* attached_pic data is embedded in the header as WM/Picture metadata */
+    if (pkt->stream_index == asf->attached_pic_index ||
+        pkt->stream_index == asf->attached_pic_thumb_index)
+        return 0;
+
     par  = s->streams[pkt->stream_index]->codecpar;
     stream = &asf->streams[pkt->stream_index];
 
@@ -1327,6 +1802,7 @@ static void asf_deinit(AVFormatContext *s)
     ASFContext *const asf = s->priv_data;
 
     av_freep(&asf->index_ptr);
+    av_freep(&asf->pkt_send_times);
 }
 
 static const AVOption asf_options[] = {
