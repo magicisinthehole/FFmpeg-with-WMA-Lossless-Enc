@@ -1801,6 +1801,7 @@ static int wmalossless_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     memcpy(avpkt->data, pkt->data, pkt->size);
     avpkt->size = pkt->size;
     avpkt->pts = ff_samples_to_time_base(avctx, pkt->pts_samples);
+    avpkt->dts = avpkt->pts;
     avpkt->duration = ff_samples_to_time_base(avctx, pkt->duration_samples);
     if (pkt->is_seekable)
         avpkt->flags |= AV_PKT_FLAG_KEY;
