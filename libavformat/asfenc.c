@@ -1700,7 +1700,8 @@ static int asf_write_packet(AVFormatContext *s, AVPacket *pkt)
     par  = s->streams[pkt->stream_index]->codecpar;
     stream = &asf->streams[pkt->stream_index];
 
-    if (par->codec_type == AVMEDIA_TYPE_AUDIO)
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO &&
+        par->codec_id != AV_CODEC_ID_WMALOSSLESS)
         flags &= ~AV_PKT_FLAG_KEY;
 
     /* extract DRC metadata from encoder side data */

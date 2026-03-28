@@ -1566,6 +1566,12 @@ static void wmalossless_packet_finalize(WMALosslessEncContext *s,
     if (used < s->par.packet_size)
         memset(s->packet_buf + used, 0, s->par.packet_size - used);
 
+    /* Patch the has_seekable bit in the packet header. The header is written
+     * before frames are encoded, but seekable placement is determined during
+     * encoding. Bit 3 of byte 0 (MSB-first bitstream) is the has_seekable flag. */
+    if (s->current_packet_has_seekable)
+        s->packet_buf[0] |= 0x08;
+
     s->written_samples += eff_samples;
     s->packet_seq = (s->packet_seq + 1) & 0xF;
     s->current_packet_has_seekable = 0;
