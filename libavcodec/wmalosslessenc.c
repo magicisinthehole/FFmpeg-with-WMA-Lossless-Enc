@@ -656,7 +656,7 @@ static int wmalossless_encode_fifo(WMALosslessEncContext *s)
     int total_samples, ret, consumed, c, d, i;
     int packet_bits_cap, header_bits, payload_cap_bits, pending_remaining;
     int carry_bits, header_payload_bits, packet_bits_used, packet_eff_samples;
-    int bits_to_write, write_remain, bits_left_after_trailer;
+    int bits_left_after_trailer;
     int more_samples_pending, will_have_more, take, frame_first, seekable;
     int frame_bits, total, remaining_bits, to_write;
     int32_t **pcm, **ch, v;
@@ -785,17 +785,30 @@ static int wmalossless_encode_fifo(WMALosslessEncContext *s)
         pkt_pts_samples = s->written_samples;
 
         if (carry_bits > 0) {
-            bits_to_write = carry_bits;
-            write_remain = FFMIN(pending_remaining, bits_to_write);
-            if (write_remain > 0) {
+            /* pending_frame_bits = frame_bits + 1, where the trailing bit is
+             * the per-frame "more frames in this packet" marker. Only the
+             * frame data lives in pending_frame_buf; the trailer's value is
+             * decided here based on what will follow in this packet, so it
+             * must be written explicitly rather than read from the buffer. */
+            const int trailer_pos = s->pending_frame_bits - 1;
+            int frame_data_left = trailer_pos - s->pending_frame_pos_bits;
+            int data_to_write;
+
+            if (frame_data_left < 0)
+                frame_data_left = 0;
+            data_to_write = FFMIN(carry_bits, frame_data_left);
+
+            if (data_to_write > 0) {
                 wmalossless_packet_write_bits(s, s->pending_frame_buf,
                                               s->pending_frame_pos_bits,
-                                              write_remain);
-                s->pending_frame_pos_bits += write_remain;
-                packet_bits_used += write_remain;
-                bits_to_write -= write_remain;
+                                              data_to_write);
+                s->pending_frame_pos_bits += data_to_write;
+                packet_bits_used += data_to_write;
             }
-            if (bits_to_write > 0) {
+
+            /* Write the trailer bit if and only if the carry covers it. */
+            if (s->pending_frame_pos_bits == trailer_pos &&
+                carry_bits > data_to_write) {
                 bits_left_after_trailer = packet_bits_cap -
                                           packet_bits_used - 1;
                 more_samples_pending = (consumed < total_samples);
@@ -803,8 +816,9 @@ static int wmalossless_encode_fifo(WMALosslessEncContext *s)
                                   more_samples_pending) ? 1 : 0;
                 bw_put_bit(&s->packet_bw, will_have_more ? 1 : 0);
                 packet_bits_used++;
-                bits_to_write--;
+                s->pending_frame_pos_bits++;
             }
+
             if (s->pending_frame_pos_bits >= s->pending_frame_bits) {
                 frame_samples = s->pending_frame_samples ?
                                 s->pending_frame_samples :
@@ -932,12 +946,27 @@ static int wmalossless_encode_fifo(WMALosslessEncContext *s)
             }
         }
 
-        wmalossless_packet_finalize(s, packet_eff_samples);
-        s->total_samples += packet_eff_samples;
+        {
+            size_t pkt_used_bytes;
 
-        ret = wmalossless_queue_packet(s, s->packet_buf, s->par.packet_size,
-                                        pkt_pts_samples, packet_eff_samples,
-                                        s->current_packet_has_seekable);
+            wmalossless_packet_finalize(s, packet_eff_samples);
+            s->total_samples += packet_eff_samples;
+
+            /* Queue only the bytes actually written, not the full
+             * packet_size. The asf muxer's padding_length field marks the
+             * unused tail of the asf packet so the demuxer never hands the
+             * zero-pad bytes to the wma decoder; this eliminates the
+             * trailing-frame phantom decode that would otherwise occur when
+             * the last packet has unused capacity (e.g. 24-bit hi-res mode
+             * where a single carried frame leaves most of the packet empty). */
+            pkt_used_bytes = (packet_bits_used + 7) >> 3;
+            if (pkt_used_bytes > s->par.packet_size)
+                pkt_used_bytes = s->par.packet_size;
+
+            ret = wmalossless_queue_packet(s, s->packet_buf, pkt_used_bytes,
+                                            pkt_pts_samples, packet_eff_samples,
+                                            s->current_packet_has_seekable);
+        }
         if (ret < 0)
             goto fail;
     }
